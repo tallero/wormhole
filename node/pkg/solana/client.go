@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/certusone/wormhole/node/pkg/solana/logs"
+	"time"
+
 	"github.com/certusone/wormhole/node/pkg/common"
 	"github.com/certusone/wormhole/node/pkg/p2p"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
@@ -19,7 +22,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"go.uber.org/zap"
-	"time"
 )
 
 type SolanaWatcher struct {
@@ -78,6 +80,25 @@ func (c ConsistencyLevel) Commitment() (rpc.CommitmentType, error) {
 	case consistencyLevelConfirmed:
 		return rpc.CommitmentConfirmed, nil
 	case consistencyLevelFinalized:
+		return rpc.CommitmentFinalized, nil
+	default:
+		return "", fmt.Errorf("unsupported consistency level: %d", c)
+	}
+}
+
+type ConsistencyLevelLog uint8
+
+// Mappings from consistency levels constants to commitment level.
+const (
+	consistencyLevelLogConfirmed ConsistencyLevelLog = 1
+	consistencyLevelLogFinalized ConsistencyLevelLog = 32
+)
+
+func (c ConsistencyLevelLog) Commitment() (rpc.CommitmentType, error) {
+	switch c {
+	case consistencyLevelLogConfirmed:
+		return rpc.CommitmentConfirmed, nil
+	case consistencyLevelLogFinalized:
 		return rpc.CommitmentFinalized, nil
 	default:
 		return "", fmt.Errorf("unsupported consistency level: %d", c)
@@ -315,6 +336,28 @@ OUTER:
 			zap.Uint64("slot", slot),
 			zap.String("commitment", string(s.commitment)))
 
+		invocations, err := logs.ParseLogs(tx.Meta.LogMessages)
+		if err != nil {
+			logger.Error("failed to parse tx logs",
+				zap.Error(err),
+				zap.Stringer("signature", signature),
+				zap.Uint64("slot", slot),
+				zap.String("commitment", string(s.commitment)),
+				zap.Strings("logs", tx.Meta.LogMessages))
+			continue
+		}
+		for _, invocation := range invocations {
+			err = s.processInvocation(logger, invocation)
+			if err != nil {
+				logger.Error("failed to process tx invocation",
+					zap.Error(err),
+					zap.Stringer("signature", signature),
+					zap.Uint64("slot", slot),
+					zap.String("commitment", string(s.commitment)))
+				continue
+			}
+		}
+
 		// Find top-level instructions
 		for i, inst := range tx.Transaction.Message.Instructions {
 			found, err := s.processInstruction(ctx, logger, slot, inst, programIndex, tx, signature, i)
@@ -545,6 +588,79 @@ func (s *SolanaWatcher) processMessageAccount(logger *zap.Logger, data []byte, a
 	)
 
 	s.messageEvent <- observation
+}
+
+func (s *SolanaWatcher) processInvocation(logger *zap.Logger, invocation *logs.Invocation) error {
+	if !invocation.Success {
+		return nil
+	}
+
+	if invocation.Program == s.contract {
+		var (
+			dataLog logs.LogLine
+			found   bool
+		)
+		for _, logLine := range invocation.Logs {
+			if logLine.Type == logs.LogLineTypeData {
+				dataLog = logLine
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+		if len(dataLog.Data) != 1 {
+			return nil
+		}
+
+		proposal, err := ParseMessagePublicationAccount(dataLog.Data[0])
+		if err != nil {
+			return fmt.Errorf("failed to parse message: %w", err)
+		}
+
+		level, err := ConsistencyLevelLog(proposal.ConsistencyLevel).Commitment()
+		if err != nil {
+			return fmt.Errorf("failed to decode consistency level: %d", proposal.ConsistencyLevel)
+		}
+		if level != s.commitment {
+			return nil
+		}
+
+		observation := &common.MessagePublication{
+			TxHash:           eth_common.Hash{}, // TODO
+			Timestamp:        time.Unix(int64(proposal.SubmissionTime), 0),
+			Nonce:            proposal.Nonce,
+			Sequence:         proposal.Sequence,
+			EmitterChain:     vaa.ChainIDSolana,
+			EmitterAddress:   proposal.EmitterAddress,
+			Payload:          proposal.Payload,
+			ConsistencyLevel: proposal.ConsistencyLevel,
+		}
+
+		solanaMessagesConfirmed.Inc()
+
+		logger.Info("message observed",
+			zap.Time("timestamp", observation.Timestamp),
+			zap.Uint32("nonce", observation.Nonce),
+			zap.Uint64("sequence", observation.Sequence),
+			zap.Stringer("emitter_chain", observation.EmitterChain),
+			zap.Stringer("emitter_address", observation.EmitterAddress),
+			zap.Binary("payload", observation.Payload),
+			zap.Uint8("consistency_level", observation.ConsistencyLevel),
+		)
+
+		s.messageEvent <- observation
+	} else {
+		for _, subInvocation := range invocation.Subcalls {
+			err := s.processInvocation(logger, subInvocation)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 type (
